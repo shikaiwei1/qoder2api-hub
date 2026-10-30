@@ -62,7 +62,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.10"
+VERSION = "1.7.11"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2687,30 +2687,55 @@ def merge_catalog(primary, realm=None):
     return out
 
 
+LOCAL_CATALOG_VERSIONS = ("catalog-v7", "catalog-v6")
+
+
+def local_catalog_files(home):
+    """本机目录缓存文件候选：新版 v7 优先、老客户端 v6 兜底（issue #74 同款降级）。
+
+    官方 1.1.81 起写 catalog-v7（格式与 v6 同为 QMC v1，只是场景更多）；仍存
+    在只有 v6 的老安装，因此两个文件名都找，同一账号目录下 v7 优先。
+    返回 [(path, uid)]，uid 是解密密钥派生用的子目录名。
+    """
+    out = []
+    try:
+        with open(os.path.join(home, "default"), encoding="utf-8") as fh:
+            uid = str(json.load(fh).get("uid") or "")
+    except Exception:
+        # issue #74：容器 / 未装官方客户端时 ~/.qoder/.models/default 天然
+        # 不存在，这是**正常降级**（最终回落到内嵌快照），不该刷 WARN。
+        uid = ""
+    try:
+        subs = [uid] if uid and os.path.isdir(os.path.join(home, uid)) else \
+            sorted(d for d in os.listdir(home) if os.path.isdir(os.path.join(home, d)))
+    except Exception:
+        return out
+    for sub in subs:
+        for fname in LOCAL_CATALOG_VERSIONS:
+            path = os.path.join(home, sub, fname)
+            if os.path.isfile(path):
+                out.append((path, sub))
+    return out
+
+
 def read_local_models(realm=None):
     """读取本机官方客户端的模型目录缓存（QMC 解密），无网络也能跟官方对齐。
 
-    路径：~/.qoder/.models/<uid>/catalog-v6（intl）/ ~/.qoder-cn/...（cn）
+    路径：~/.qoder/.models/<uid>/catalog-v7（1.1.81+，v6 兜底）
     返回 [(key, meta)]；任何失败返回 []（回退静态快照）。
     """
     r = realm or CURRENT_REALM
     home = os.path.join(os.path.expanduser("~"),
                         get_realm_config(r)["home_dir"], ".models")
     try:
-        default_path = os.path.join(home, "default")
-        uid = ""
-        with open(default_path, encoding="utf-8") as fh:
-            uid = str(json.load(fh).get("uid") or "")
-        subdirs = [uid] if uid and os.path.isdir(os.path.join(home, uid)) else \
-            [d for d in os.listdir(home) if os.path.isdir(os.path.join(home, d))]
-        for sub in subdirs:
-            cat = os.path.join(home, sub, "catalog-v6")
-            if not os.path.isfile(cat):
+        from qoder_sign import qmc_decrypt
+        for cat, sub in local_catalog_files(home):
+            try:
+                with open(cat, "rb") as fh:
+                    blob = fh.read().decode("ascii", "replace")
+                plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
+            except Exception:
                 continue
-            with open(cat, "rb") as fh:
-                blob = fh.read().decode("ascii", "replace")
-            from qoder_sign import qmc_decrypt
-            plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
             chat = plain.get("chat") or []
             out = []
             for m in chat:
@@ -2726,10 +2751,6 @@ def read_local_models(realm=None):
                 log("model catalog read from local client cache: %d models (%s)"
                     % (len(out), r))
                 return out
-    except FileNotFoundError:
-        # issue #74 补充：容器 / 未装官方客户端时 ~/.qoder/.models/default 天然
-        # 不存在，这是**正常降级**（最终回落到内嵌快照），不该刷 WARN 让人误判。
-        pass
     except Exception as exc:
         log("local model catalog read skipped: %s" % exc, level="DEBUG")
     return []
@@ -2775,23 +2796,131 @@ def _load_models_cache(realm):
         return []
 
 
-def fetch_models(realm=None):
+def _register_live_names(entries):
+    """把清单条目的 display_name -> key 注册进解析器（官方改显示名窗口期）。
+
+    动态接口 / 本机目录缓存 / 落盘缓存里 display_name 永远比冻结快照新鲜；
+    注册后 resolve_upstream_key 才认得 /v1/models 正在广告的新名字
+    （如 kmodel_latest 改显示名 Kimi-K3 -> Kimi-K3.1-Pro，详见
+    qoder_catalog.register_live_display_names 的注释）。失败静默：清单
+    拉不出来时冻结别名表仍在，行为退回改动前。
+    """
+    try:
+        pairs = []
+        for mid, meta in entries or []:
+            name = str((meta or {}).get("display_name")
+                       or (meta or {}).get("name") or "").strip()
+            if name and mid:
+                pairs.append((name, mid))
+        if pairs:
+            qoder_catalog.register_live_display_names(pairs)
+    except Exception:
+        pass
+
+
+_LIVE_NAMES_SYNC_AT = {}
+_LIVE_NAMES_LOCK = threading.Lock()
+
+
+def _ensure_live_names(realm=None):
+    """确保动态清单的显示名已注册进解析器（每区域 300s 至多一次，失败静默）。
+
+    聊天主链路的兜底：客户端可以不看 /v1/models 直接发模型名（配了固定模型
+    的脚本/智能体），此时 fetch_models 可能一次都没跑过，解析器里没有动态
+    显示名——第一次解析失败时在这里补注册。**只读离线源**（allow_network=
+    False）：请求路径里出网拉 model/list 会多一次出站调用并触发 POOL.pick
+    轮换账号（破坏 #86 钉死账号语义）；在线清单由启动预热线程与 /v1/models
+    等常规路径负责刷新。
+    """
+    r = realm if realm in ("cn", "intl") else CURRENT_REALM
+    with _LIVE_NAMES_LOCK:
+        if time.time() - _LIVE_NAMES_SYNC_AT.get(r, 0.0) < 300:
+            return
+        _LIVE_NAMES_SYNC_AT[r] = time.time()
+    try:
+        _register_live_names(fetch_models(realm=r, allow_network=False))
+    except Exception:
+        # 失败不占节流窗口：离线源只是本地文件探测，让下一条请求能立即重试，
+        # 冷启动竞态（预热线程还没跑完就来了第一条请求）不会白等 300s。
+        with _LIVE_NAMES_LOCK:
+            _LIVE_NAMES_SYNC_AT[r] = 0.0
+
+
+def resolve_model_key(model, realm=None):
+    """open_upstream 用的模型名解析：冻结表优先，未命中时同步动态名再试一次。
+
+    返回原样字符串 = 真未知（BYOK 自定义模型等，透传语义保持不变）；
+    官方改了显示名的情况（快照未跟上）由第二次解析兜住。
+    """
+    key = qoder_catalog.resolve_upstream_key(model, realm=realm)
+    raw = str(model or "").strip()
+    if key and key == raw and not qoder_catalog.is_known_upstream_key(key, realm):
+        _ensure_live_names(realm)
+        key = qoder_catalog.resolve_upstream_key(model, realm=realm)
+    return key
+
+
+# 离线合并结果的短 TTL memo（MAJOR：请求路径每请求一次磁盘 IO 的节流）。
+# 离线模式不写 _models_cache（会挡住在线刷新），但没有自己的 memo 时，
+# 降级环境（无账号 / 上游持续失败 / 容器重启后）每条请求都会重读
+# models-cache JSON 甚至重解密本机目录缓存。
+_OFFLINE_MODELS_TTL = 60.0
+_offline_models_cache = {}      # realm -> (at, entries)，受 _lock 保护
+
+
+def _offline_models_memo_get(r):
+    hit = _offline_models_cache.get(r)
+    if hit and time.time() - hit[0] < _OFFLINE_MODELS_TTL:
+        return hit[1]
+    return None
+
+
+def fetch_models(realm=None, allow_network=True):
+    """合并三级来源的模型清单（[(key, meta)]，官方 UI 顺序）。
+
+    allow_network=False 供**请求路径**（resolve_model_key 的惰性同步、
+    catalog_meta_for 的元数据查询）使用：只读离线源（内存缓存 / issue #58
+    落盘缓存 / 本机官方目录缓存），不出网、不碰账号池（#86），且结果有
+    60s memo——磁盘 IO 每分钟至多一次。请求路径里调 read_dynamic_models
+    会多一次 model/list 出站调用（打乱 failover 序列）并触发 POOL.pick。
+    """
     r = realm or CURRENT_REALM
     with _lock:
         c = _models_cache.get(r) or {"at": 0.0, "data": None}
         if c["data"] and time.time() - c["at"] < 300:
             return c["data"]
+        if not allow_network:
+            memo = _offline_models_memo_get(r)
+            if memo is not None:
+                return memo
     # 1) 动态接口（需要账号） 2) 本机官方目录缓存 3) 内嵌静态快照
-    live = read_dynamic_models(realm=r)
-    if live:
-        _save_models_cache(r, live)      # issue #58：成功的动态清单落盘
+    live = []
+    if allow_network:
+        live = read_dynamic_models(realm=r)
+        if live:
+            _save_models_cache(r, live)      # issue #58：成功的动态清单落盘
+    if not live:
+        # 过期的内存缓存也好过没有：display_name -> key 的映射几乎不会变旧
+        # （官方改显示名的窗口期里，旧映射最多让新名字解析不到，不会解析错）
+        with _lock:
+            live = (_models_cache.get(r) or {}).get("data") or []
     if not live:
         live = _load_models_cache(r)     # 动态拿不到时先用上次成功的结果
     if not live:
         live = read_local_models(realm=r)
-    entries = merge_catalog(live, realm=r)
-    with _lock:
-        _models_cache[r] = {"at": time.time(), "data": entries}
+    entries = merge_catalog(live or None, realm=r)
+    # 广告的名字（/v1/models 的 id）与解析器认知同源：清单一到手就注册显示名
+    _register_live_names(entries)
+    if allow_network:
+        with _lock:
+            _models_cache[r] = {"at": time.time(), "data": entries}
+            # 在线刷新出了新数据：旧 memo 作废，离线消费者立即看到新显示名
+            _offline_models_cache.pop(r, None)
+    else:
+        # 只进 memo（短 TTL），不写 _models_cache：把离线合并结果标成
+        # 「新鲜」会挡住 /v1/models 等在线路径 300s 内的正常网络刷新。
+        with _lock:
+            _offline_models_cache[r] = (time.time(), entries)
     return entries
 
 
@@ -3402,8 +3531,25 @@ def catalog_meta_for(model_key, realm=None):
 
     Anthropic 入口在调用 qoder_anthropic.messages_to_chat 时需要一个 meta，
     否则 effort_from_anthropic 取不到 supported 档位表 -> 思考档位被静默丢弃。
+
+    优先动态清单（display_name / thinking_config / 上下文窗口都是官方**此刻**
+    的口径；快照可能还停在旧显示名，如 kmodel_latest 的 Kimi-K3 ->
+    Kimi-K3.1-Pro 改名），静态快照兜底。fetch_models 自带 300s 缓存与
+    「动态 > 落盘 > 本机 > 快照」降级，离线/无账号时退回快照，行为不变。
     """
-    for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+    r = realm if realm in ("cn", "intl") else CURRENT_REALM
+    try:
+        # 请求路径也会走到这里（build_qoder_body / Anthropic 档位表）——离线取
+        # （allow_network=False）：在线刷新由启动预热线程与 /v1/models 负责，
+        # 请求内不做额外出站调用、不碰账号池（#86 钉死账号语义）。
+        for mid, meta in fetch_models(realm=r, allow_network=False):
+            if mid == model_key and meta:
+                out = dict(meta)
+                out.setdefault("key", model_key)
+                return out
+    except Exception:
+        pass
+    for m in qoder_catalog.models_for_realm(r):
         if m.get("key") == model_key:
             return m
     for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
@@ -5557,17 +5703,10 @@ def build_qoder_body(payload, account, model_key, realm=None):
     body["aliyun_user_type"] = getattr(account, "user_type", "") or \
         qoder_sign.DEFAULT_USER_TYPE
 
-    # model_config（按出口区域的官方清单取元数据 + 动态 key）
-    catalog_meta = {}
-    for m in qoder_catalog.models_for_realm(r):
-        if m.get("key") == model_key:
-            catalog_meta = m
-            break
-    if not catalog_meta:
-        for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
-            if m.get("key") == model_key:
-                catalog_meta = m
-                break
+    # model_config（按出口区域的官方清单取元数据 + 动态 key）——动态清单优先
+    # （catalog_meta_for），官方改显示名（Kimi-K3 -> Kimi-K3.1-Pro）后这里
+    # 发出去的 display_name 仍是官方此刻的名字，与真实客户端一致。
+    catalog_meta = catalog_meta_for(model_key, r)
     mc = body.get("model_config") or {}
     mc["key"] = model_key
     mc["display_name"] = catalog_meta.get("display_name") or model_key
@@ -5650,6 +5789,14 @@ def build_qoder_body(payload, account, model_key, realm=None):
     biz.setdefault("product", "cli")
     biz.setdefault("type", "agent")
     biz.setdefault("stage", "start")
+    # 计费归属（2026-10-30 实测，Kimi-K3.1-Pro 被 qoder 后台记成 auto 的根因）：
+    # 官方 CLI 1.1.81 的 business 块带 model_key，上游计费归因读它；网关此前
+    # 不发，kmodel_latest 这类模型被静默归到 auto（老模型不受影响，疑似有
+    # model_config 兜底）。与官方客户端对齐，始终带上。
+    biz["model_key"] = model_key
+    # 同理对齐版本号：官方报自己的真实版本，模板里 0.1.43 是上个时代的残留。
+    # 版本号不影响计费归属（A/B 实测），但身份故事应与 cosy-version 同源。
+    biz["version"] = qoder_sign.COSY_VERSION
     body["business"] = biz
     return body
 
@@ -7020,7 +7167,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             if usage_ctx is not None:
                 # 确定性原因 → 面板直接显示，不必自己推断
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
-    model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
+    model_key = resolve_model_key(model, realm=realm)
 
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
     representative = (only_account if only_account is not None
@@ -9310,9 +9457,13 @@ class Handler(BaseHTTPRequestHandler):
                                                  "(check account/network)"})
             _save_models_cache(req_realm, live)
             entries = merge_catalog(live, realm=req_realm)
+            # 与 fetch_models 同步注册显示名 + 作废离线 memo：手动刷新后
+            # 新显示名立即可解析，不用等节流窗口。
+            _register_live_names(entries)
             with _lock:
                 _models_cache[req_realm] = {"at": time.time(),
                                             "data": entries}
+                _offline_models_cache.pop(req_realm, None)
             return self._json(200, {"ok": True, "realm": req_realm,
                                     "count": len(entries),
                                     "ids": [mid for mid, _m in entries]})
@@ -10585,7 +10736,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, problem, "invalid_request_error")
         req_realm = self._request_realm()
         model_hint = payload.get("model") or "auto"
-        model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
+        # 与 open_upstream 同一解析器（含动态显示名兜底）：官方改显示名窗口期
+        # Anthropic 首条请求才不会原样透传（meta 取不到 -> 思考档位被静默丢弃）。
+        model_key = resolve_model_key(model_hint, realm=req_realm)
         # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
         meta = catalog_meta_for(model_key, req_realm)
         chat_req = qoder_anthropic.messages_to_chat(
@@ -12019,6 +12172,21 @@ def main():
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))
+
+    # 启动预热（后台线程，不阻塞监听）：拉一次动态模型清单并注册显示名，
+    # 让「客户端跳过 /v1/models 直接发新模型名」的第一条请求也能解析对
+    # （官方改显示名窗口期，如 kmodel_latest 的 Kimi-K3 -> Kimi-K3.1-Pro）。
+    # 失败静默——落盘缓存 / 本机目录缓存 / 冻结别名表仍然兜底。
+    def _warm_models():
+        for _r in ("cn", "intl"):
+            try:
+                fetch_models(realm=_r)
+            except Exception:
+                pass
+
+    _warm = threading.Thread(target=_warm_models, name="qd-models-warm",
+                             daemon=True)
+    _warm.start()
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
