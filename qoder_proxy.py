@@ -548,21 +548,6 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     fields = _extract_usage(usage)
     if not fields:
         return None
-    # issue #105：上游可能**静默换模型计费**（实测把 kmodel_latest 记成 auto）。
-    # 只有换号时才多写一个键——旧行格式零变化，面板/统计按需显示。
-    _billed = str((usage or {}).get("model") or "")
-    if _billed and _billed != str(model or ""):
-        fields["billed_model"] = _billed
-        # 上游对网关身份常常统一回报 "auto"（issue #113 实测：dfmodel 也一样），
-        # 逐请求 WARN 会把日志刷满——同一 (请求, 回报) 组合每小时只提醒一次。
-        _bk = (str(model or ""), _billed)
-        _now = time.time()
-        if _now - _BILLED_WARN_AT.get(_bk, 0) > 3600:
-            _BILLED_WARN_AT[_bk] = _now
-            log("upstream reports a different model name: requested=%s billed=%s"
-                " (billing/quota attribution follows the upstream name;"
-                " check /diag/model-billing)" % (model, _billed),
-                level="WARN", tag="chat")
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -10093,59 +10078,60 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "token": token})
         return self._unknown_path_error(path)
 
-    def _handle_diag_billing(self, payload):
-        """issue #113：发最小请求，回报上游实际按哪个模型计费。"""
-        # issue #113：上游可能「静默按另一个模型计费」（kmodel_latest -> auto）。
-        # 这里发一个最小请求，把**上游实际回报的模型名**取回来，便于用户自证。
-        model = str((payload or {}).get("model") or "").strip()
-        if not model:
-            return self._error(400, "model required")
-        realm = (payload or {}).get("realm") or self._request_realm()
-        probe_payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "stream": True,
-            "max_tokens": 16,
-        }
-        billed, usage, chunks = set(), None, 0
-        t0 = time.time()
+    # issue #121：/diag/model-billing 已移除——上游对网关身份一律回报 "auto"，    # 该字段不携带计费信息，据此提示用户只会误导（用户实测国际版同样如此）。
+    def _handle_diag_checkin(self, payload):
+        """issue #123：签到诊断——把每一步的上游结果原样吐出来，便于定位。
+
+        只读：不发 claim（不会误领/重复领）。回显内容不含 token，只给状态与
+        活动 key/标题，够用来比对"官方客户端能领、网关看不到"的差异。
+        """
+        uid = str((payload or {}).get("uid") or "").strip()
+        acc = POOL.get(uid) if uid else None
+        if acc is None:
+            return self._error(404, "no such account: %s" % (uid or "-"))
+        out = {"ok": True, "uid": acc.uid[:8], "realm": acc.realm,
+               "enabled": bool(acc.enabled),
+               "capability": None, "capability_reason": "",
+               "status": None, "campaigns": None, "can_checkin": None,
+               "last_checkin": acc.last_checkin}
         try:
-            resp, acc, _ = open_upstream(probe_payload, target_realm=realm)
-            for line in iter_inner_sse(resp, holder=None):
-                chunks += 1
-                text = line.decode("utf-8", "replace")
-                for m in re.findall(r'"model"\s*:\s*"([^"]+)"', text):
-                    if "chat.completion" not in m:
-                        billed.add(m)
-                if '"usage"' in text and chunks > 1:
-                    usage = text
-                if chunks > 400:
-                    break
-            resp.close()
-        except UpstreamStatus as exc:
-            return self._json(200, {"ok": False, "model": model,
-                                    "error": "upstream status %s" % exc.status,
-                                    "detail": str(exc.detail)[:300],
-                                    "elapsed_ms": int((time.time() - t0) * 1000)})
+            cap, reason = acc.checkin_capability()
+            out["capability"] = cap
+            out["capability_reason"] = reason
         except Exception as exc:
-            return self._json(200, {"ok": False, "model": model,
-                                    "error": str(exc)[:300],
-                                    "elapsed_ms": int((time.time() - t0) * 1000)})
-        got = sorted(billed)
-        mismatch = bool(got) and model not in got
-        if mismatch:
-            log("diag model-billing: requested=%s billed=%s (upstream re-routed)"
-                % (model, ",".join(got)), level="WARN", tag="diag")
-        return self._json(200, {
-            "ok": True,
-            "model": model,
-            "realm": realm,
-            "billed": got,
-            "billed_mismatch": mismatch,
-            "account": (acc.uid[:8] if acc else None),
-            "chunks": chunks,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        })
+            out["capability_reason"] = "probe failed: %s" % str(exc)[:120]
+        try:
+            ok, st = acc.checkin_status()
+            out["status"] = {"ok": ok, "detail": st}
+        except Exception as exc:
+            out["status"] = {"ok": False, "error": str(exc)[:200]}
+        try:
+            out["can_checkin"] = bool(acc.can_checkin())
+        except Exception:
+            pass
+        try:
+            res = acc.campaigns()
+            items = res if isinstance(res, list) else (
+                (res or {}).get("campaigns") or (res or {}).get("list")
+                or (res or {}).get("data") or [])
+            if not isinstance(items, list):
+                items = []
+            out["campaigns"] = {
+                "count": len(items),
+                # 字段名各区域不同（campaignId/id/title/name/...），这里把
+                # 标量字段原样列出来，比猜字段名对定位更有用；token 不在活动
+                # 对象里，回显安全。
+                "items": [{"keys": sorted(c.keys())[:12],
+                           "scalars": {k: v for k, v in c.items()
+                                        if isinstance(v, (str, int, bool))}
+                           if isinstance(c, dict) else {},
+                           "label": qoder_accounts.campaign_label(c)}
+                          for c in items[:8] if isinstance(c, dict)],
+            }
+        except Exception as exc:
+            out["campaigns"] = {"error": str(exc)[:200]}
+        return self._json(200, out)
+
 
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
@@ -11354,8 +11340,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Anthropic Messages（task-78 接线）：两条都要进白名单，
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
                 "/v1/messages", "/v1/messages/count_tokens",
-                # issue #113：模型计费自检（面板鉴权，见下方分支）
-                "/diag/model-billing"):
+                # issue #123：签到诊断（只读，面板鉴权）
+                "/diag/checkin"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -11371,12 +11357,11 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
-        if path == "/diag/model-billing":
-            # issue #113：模型计费自检（面板鉴权）
+        if path == "/diag/checkin":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
-            return self._handle_diag_billing(payload)
+            return self._handle_diag_checkin(payload)
         if is_account_route:
             return self._handle_accounts(path, payload)
         # 本地 web 工具：客户端声明了内置 web_search / web_fetch 时由网关代跑
