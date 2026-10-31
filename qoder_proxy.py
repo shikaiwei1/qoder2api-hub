@@ -4171,6 +4171,117 @@ def _marker_only_echo(text):
     return rest == ""
 
 
+def _leak_residue_present(text):
+    """这段文本是不是「剥不干净的协议残片」——不是散文里提到标记，是真的漏了。
+
+    issue #49 的三条「认不出就当正文补发」分支都是 fail-open：残片进到客户端
+    的 content 里，coding agent 会把标记与半截参数当成工具协议去解析，结果是
+    整轮任务静默中断（2026-10-30 实测 4828 字符残片打断一次、31 字符一次）。
+
+    判据必须**双向精确**：
+      · 没有泄漏标记 -> 不是残片（普通正文/示例代码）；
+      · 有标记但只是散文在讨论它（没有标签、没有 JSON 键）-> 不是残片，
+        否则「解释这个 bug 的那轮回复」会被自己打断，客户端无限重试。
+    """
+    t = str(text or "")
+    if not t or not (LEAK_MARKER in t or LEAK_MARKER_ALT in t):
+        return False
+    if "DSML" in t and "<" in t:                       # DSML 标签残片
+        return True
+    if "</" in t:                                      # 闭标签尾巴
+        return True
+    if re.search(r'"(?:arguments|name)"\s*:', t):      # 半截调用参数
+        return True
+    return "<tool_call" in t or '{"' in t
+
+
+_LEAK_STRUCT_RE = re.compile(
+    r"name\s*=\s*[\"']"                 # DSML invoke/parameter 属性
+    r"|<tool_call"                      # 伪标签
+    r"|\"(?:arguments|name)\"\s*:"      # JSON 调用字段
+    r"|\{\""                            # 参数对象开头
+)
+
+
+_LEAK_TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z_][\w:.-]*\s*/?\s*>")
+
+# DSML 令牌：`<|DSML|calls>` / `</｜DSML｜｜ parameter>` / `<｜DSML｜invoke>` 都算
+_DSML_TOKEN_RE = re.compile(r"<[^<>]{0,4}DSML|DSML[^<>]{0,4}>|｜DSML｜")
+
+
+def _dsml_residue_present(text):
+    """有 DSML 协议令牌或别的协议结构 —— **不要求出现 LEAK_MARKER**。
+
+    `_sse_recover_dsml` 只有在上游流里出现过 DSML 令牌时才会被调用，所以进到它的
+    尾部 else 分支时，DSML 本身已经确认存在。2026-10-30 17:58 实测漏了一条
+    `markers=0, dsml=3` 的 58 字符残片：只带 DSML 令牌、没有 LEAK_MARKER，
+    用 `_leak_residue_present` 判就漏过去了。
+    """
+    t = str(text or "")
+    if not t or "DSML" not in t:
+        return False
+    if _DSML_TOKEN_RE.search(t):
+        return True
+    return bool(_LEAK_STRUCT_RE.search(t) or _LEAK_TAG_RE.search(t))
+
+
+_FENCE_RE = re.compile(r"```.*?(?:```|$)|`[^`\n]{0,200}`", re.S)
+
+
+def _outside_fences(text):
+    """剥掉代码块/行内代码后的正文。
+
+    非流式侧拿到的是全文，用户/模型**在代码块里讲解本协议**是正常内容
+    （例如「DSML 格式长这样：```<|DSML|calls>…```」）。判定残片前先剥掉围栏，
+    否则会把一段教学示例判成泄漏，白白 502 一次。
+    """
+    return _FENCE_RE.sub("", str(text or ""))
+
+
+def _residue_text_only(text):
+    """回读成功后剩下的文本里还带协议残片 -> 该丢（不影响已恢复的调用）。"""
+    t = str(text or "")
+    if not t or _leak_garbage_only(t):
+        return False
+    return bool(_leak_residue_present(t) or _dsml_residue_present(t))
+
+
+def _leak_garbage_only(text):
+    """只有泄漏标记和空壳标签，**没有任何可恢复结构**（issue #49 形态 3）。
+
+    形态 3 = `[assistant 请求调用工具]` + `<terminal></terminal>` 刷 54 遍：
+    既没有 JSON 也没有 invoke 属性，回读必然失败。此前它是 fail-open 补发，
+    结果是客户端正文被标记与空标签塞满，coding agent 解析工具协议时直接
+    断在半路（2026-10-30 实测 31 字符残片打断一次）。
+
+    判据必须窄：**文本里得有真正的 HTML 式空标签**才算这种垃圾。
+    散文里提到标记（"关于 [assistant 请求调用工具] 这个标记…"）没有标签，
+    必须原样透传 —— 既有 #37/#60 的逐字节守恒测试就盯着这条。
+    """
+    t = str(text or "")
+    if not t or not (LEAK_MARKER in t or LEAK_MARKER_ALT in t):
+        return False
+    if _LEAK_STRUCT_RE.search(t):
+        return False
+    return _LEAK_TAG_RE.search(t) is not None
+
+
+def _echo_names_all_undeclared(text, allowed_names):
+    """回声里出现的工具名**全部不在**本次声明集合里（issue #27 的 fail-open 边界）。
+
+    模型复述一个没声明的工具时，我们本来就没有可恢复的调用可言，把这种残片判成
+    失败会误伤一批正常回合（既有 _test_issue37 / _test_qoder 都盯着这条）。
+    """
+    if not allowed_names:
+        return False
+    t = str(text or "")
+    names = re.findall(r'"name"\s*:\s*"([^"]{1,120})"', t)
+    names += re.findall(r'name\s*=\s*["\']([^"\']{1,120})["\']', t)
+    if not names:
+        return False
+    return all(n not in allowed_names for n in names)
+
+
 class InvalidToolArguments(UpstreamStatus):
     """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
 
@@ -4949,6 +5060,12 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
                 if len(hold) > _HOLD_MAX_CHARS \
                         or hold_frames > _HOLD_MAX_FRAMES:
+                    # issue #112：超限放行前先补一次 #72 判定 —— marker-only 的
+                    # 空壳块走到这里会被当正文发出去，绕过流末的 fail-closed
+                    # （实测日志：released oversized leak hold (21 chars /
+                    # 201 frames) — fail-open）。
+                    if allowed_names and _marker_only_echo(hold):
+                        raise EmptyToolEcho(len(hold), "marker_only_released")
                     log("released oversized leak hold (%d chars / %d frames) "
                         "— fail-open" % (len(hold), hold_frames),
                         level="WARN", tag="chat")
@@ -4995,8 +5112,27 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
             # 可恢复，但必须让发生率可见，而不是静默失真）。
             _log_unrecovered_leak(hold, "stream-falsified")
-            # 证伪：暂存整段补发为普通正文
-            yield _leak_chunk_frame(meta, {"content": hold})
+            if _leak_garbage_only(hold):
+                # issue #49 形态3：只有标记 + 空壳标签，补发出去只会污染客户端正文
+                log("dropped bare tool-protocol residue (%d chars) — issue #49 form3"
+                    % len(hold), level="WARN", tag="chat")
+            elif (allowed_names
+                    and _leak_residue_present(hold)
+                    and not parse_dsml_tool_calls(hold)[0]
+                    and not _echo_names_all_undeclared(hold, allowed_names)):
+                # issue #120 后续：可被 DSML 解析器还原的残片要留给下游
+                # _sse_recover_dsml（它才是 DSML 回读者），这里只拦真正还原不了的。
+                # 注意：这条分支是**流中途**判定，绝不能把 `_dsml_residue_present`
+                # 也算进来 —— 分块投递时 hold 可能只是 DSML 调用的前半截
+                # （_test_issue50_51_52 的 B 形态 n=8 就是这样），中途判死会把
+                # 本来能恢复的整轮打断；DSML 残片的 fail-closed 留给流末分支。
+                log("unrecovered leak residue in tools session (%d chars) — "
+                    "failing the turn closed (issue #49)" % len(hold),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(hold), "unrecovered_falsified")
+            else:
+                # 证伪：暂存整段补发为普通正文
+                yield _leak_chunk_frame(meta, {"content": hold})
             hold = None
             hold_frames = 0
             if fin:
@@ -5050,7 +5186,11 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     "type": call.get("type") or "function",
                     "function": call.get("function") or {},
                 }]})
-            if clean:
+            if clean and _residue_text_only(clean):
+                # issue #120 后续：同上（marker 回声回读成功后的剩余文本）
+                log("dropped residue in post-recovery text (%d chars) — issue #49"
+                    % len(clean), level="WARN", tag="chat")
+            elif clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
         elif _echo_with_bad_args(hold, allowed_names):
             # issue #37（fail-closed）**必须先于 #9/#11 判定**：坏参数块的外层
@@ -5092,7 +5232,19 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         else:
             # issue #49 方向 C：认不出但**看起来就是协议回声**的，必须留痕。
             _log_unrecovered_leak(hold, "stream")
-            yield _leak_chunk_frame(meta, {"content": hold})
+            if _leak_garbage_only(hold):
+                log("dropped bare tool-protocol residue (%d chars) — issue #49 form3"
+                    % len(hold), level="WARN", tag="chat")
+            elif (allowed_names
+                    and (_leak_residue_present(hold) or _dsml_residue_present(hold))
+                    and not parse_dsml_tool_calls(hold)[0]
+                    and not _echo_names_all_undeclared(hold, allowed_names)):
+                log("unrecovered leak residue in tools session (%d chars) — "
+                    "failing the turn closed (issue #49)" % len(hold),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(hold), "unrecovered_leak")
+            else:
+                yield _leak_chunk_frame(meta, {"content": hold})
     if finished is not None:
         payload, fin = finished
         if recovered:
@@ -5208,7 +5360,12 @@ def _sse_recover_dsml(frames, allowed_names=None):
         if calls:
             recovered = True
             RECOVERY_STATS["dsml"] = RECOVERY_STATS.get("dsml", 0) + 1
-            if clean:
+            if clean and _residue_text_only(clean):
+                # issue #120 后续：调用已恢复，但剥离后的剩余文本仍带协议残片
+                # （嵌套/重复块导致剥离不干净）—— 丢掉残片，别再喂给客户端。
+                log("dropped residue in post-recovery text (%d chars) — issue #49"
+                    % len(clean), level="WARN", tag="chat")
+            elif clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
             for i, call in enumerate(calls):
                 yield _leak_chunk_frame(meta, {"tool_calls": [{
@@ -5220,9 +5377,27 @@ def _sse_recover_dsml(frames, allowed_names=None):
                 }]})
         else:
             _log_unrecovered_leak(buf, "dsml-stream")
-            yield _leak_chunk_frame(meta, {"content": buf})
+            if _leak_garbage_only(buf):
+                log("dropped bare tool-protocol residue (%d chars) — issue #49 form3"
+                    % len(buf), level="WARN", tag="chat")
+            elif (allowed_names
+                    and (_leak_residue_present(buf) or _dsml_residue_present(buf))
+                    and not _echo_names_all_undeclared(buf, allowed_names)):
+                log("unrecovered DSML leak residue in tools session (%d chars) "
+                    "— failing the turn closed (issue #49)" % len(buf),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(buf), "unrecovered_dsml")
+            else:
+                yield _leak_chunk_frame(meta, {"content": buf})
     if tail:
-        yield _leak_chunk_frame(meta, {"content": tail})
+        if _residue_text_only(tail):
+            # issue #120 后续（Ultimate 审计 5232 行）：tail 是流末 holdback 的
+            # 尾巴，原先无条件当正文补发 —— 截在 `<|DSML|inv` 中间、或第二个
+            # DSML 块的开头都会从这条漏出去。含残片就丢。
+            log("dropped residue tail (%d chars) — issue #49" % len(tail),
+                level="WARN", tag="chat")
+        else:
+            yield _leak_chunk_frame(meta, {"content": tail})
     if finish is not None:
         payload, fin = finish
         if recovered:
@@ -5236,15 +5411,70 @@ def _sse_recover_dsml(frames, allowed_names=None):
         yield _leak_chunk_frame(meta, {}, "tool_calls")
 
 
+def _sse_guard_truncated_tool_args(frames):
+    """issue #112：上游在 tool_calls 的 arguments 还没写完时就干净 EOF。
+
+    症状（客户端侧）：流里出现了一半的 `tool_calls` 增量，随后既没有
+    `finish_reason` 也没有错误帧，连接正常关闭 —— coding agent 只看到
+    「参数不完整的调用 + 流结束」，整轮任务静默中断，用户看到的就是
+    「助手突然只回了几个命令片段就停了」。
+
+    这里在流末做一次完整性校验：累计到过 tool_call 增量、没收到
+    finish_reason、且某个调用的 arguments 不是合法 JSON -> 抛
+    EmptyToolEcho（fail-closed）。四条协议出口会把它转成明确失败，
+    客户端据此重试，而不是把半截调用当成功收尾。其余情况逐字节透传。
+    """
+    calls = {}
+    finish_seen = False
+    for raw in frames:
+        try:
+            text = (raw.decode("utf-8", "replace")
+                    if isinstance(raw, bytes) else raw)
+            data = strip_data_prefix(text)
+            if data and data != "[DONE]":
+                payload = json.loads(data)
+                choice = (payload.get("choices") or [{}])[0] or {}
+                if choice.get("finish_reason"):
+                    finish_seen = True
+                for tc in ((choice.get("delta") or {}).get("tool_calls") or []):
+                    idx = tc.get("index")
+                    idx = 0 if idx is None else idx
+                    slot = calls.setdefault(idx, {"args": "", "name": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+        except Exception:
+            pass
+        yield raw
+    if not calls or finish_seen:
+        return
+    for _idx, slot in sorted(calls.items()):
+        args = (slot.get("args") or "").strip()
+        if not args:
+            continue
+        try:
+            json.loads(args)
+        except Exception:
+            log("stream ended without finish_reason and tool call '%s' has "
+                "incomplete JSON arguments (%d chars) — failing closed "
+                "(issue #112)" % (slot.get("name") or "?", len(args)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(args), "truncated_arguments")
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
-    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
+    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）
+    + 截断参数守卫（issue #112）。
 
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
     """
-    for frame in _sse_fill_tool_call_ids(
-            _sse_recover_dsml(
-                _recover_leaked_tool_calls_inner(frames, allowed_names),
-                allowed_names)):
+    for frame in _sse_guard_truncated_tool_args(
+            _sse_fill_tool_call_ids(
+                _sse_recover_dsml(
+                    _recover_leaked_tool_calls_inner(frames, allowed_names),
+                    allowed_names))):
         yield frame
 
 
@@ -7855,6 +8085,22 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             else:
                 # issue #49 方向 C：四条路径都没认出来 -> 至少留痕（非流式侧）
                 _log_unrecovered_leak(_echo_src, "aggregate")
+                # issue #120 后续：非流式侧同样不许把协议残片留在 content 里。
+                # 非流式没有"重试"概念，但抛 EmptyToolEcho 会走既有 502 出口，
+                # 客户端重发这一轮 —— 比返回一段被污染的回答强。
+                if _leak_garbage_only(_echo_src):
+                    log("dropped bare tool-protocol residue (%d chars) — "
+                        "issue #49 form3 (aggregate)" % len(_echo_src),
+                        level="WARN", tag="chat")
+                    message["content"] = _head16
+                elif (allowed_names
+                        and (_leak_residue_present(_outside_fences(_echo_src))
+                             or _dsml_residue_present(_outside_fences(_echo_src)))
+                        and not _echo_names_all_undeclared(_echo_src, allowed_names)):
+                    log("unrecovered leak residue in tools session (%d chars) — "
+                        "failing the turn closed (aggregate)" % len(_echo_src),
+                        level="WARN", tag="chat")
+                    raise EmptyToolEcho(len(_echo_src), "unrecovered_aggregate")
     # issue #51：DeepSeek DSML 回退（非流式 chat 侧此前**完全没有**这一层，
     # 只有 Responses 有）——模型直接吐原生 DSML 时整段协议会当正文返回。
     if not tool_calls_map and "DSML" in (message.get("content") or ""):
@@ -7871,6 +8117,23 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                 finish = "tool_calls"
         else:
             _log_unrecovered_leak(message["content"], "aggregate-dsml")
+            # issue #120 后续：非流式 DSML 回退也解析不出来时，不许把整段
+            # DSML 协议留在 content 里当正文返回（这正是 17:38 那条 4828 字符
+            # 泄漏在非流式侧的等价路径）。空壳残片丢弃，其余走 502 出口。
+            _bad_dsml = message["content"] or ""
+            if _leak_garbage_only(_bad_dsml):
+                log("dropped bare tool-protocol residue (%d chars) — "
+                    "issue #49 form3 (aggregate-dsml)" % len(_bad_dsml),
+                    level="WARN", tag="chat")
+                message["content"] = ""
+            elif (allowed_names
+                    and (_leak_residue_present(_outside_fences(_bad_dsml))
+                         or _dsml_residue_present(_outside_fences(_bad_dsml)))
+                    and not _echo_names_all_undeclared(_bad_dsml, allowed_names)):
+                log("unrecovered DSML residue in tools session (%d chars) — "
+                    "failing the turn closed (aggregate-dsml)" % len(_bad_dsml),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(_bad_dsml), "unrecovered_aggregate_dsml")
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -8758,6 +9021,19 @@ def stream_responses_events(inner_lines, model, holder):
             if not calls_rem:
                 # issue #49 方向 C：Responses 侧同样留痕（DSML 也解析不出来时）
                 _log_unrecovered_leak(clean_rem or text_buffer, "responses")
+                # issue #120 后续：Responses 侧也不许把残片当正文补发。
+                # 空壳残片（只有标记 + 空标签）直接丢：text_buffer 不清空就不会进
+                # text_parts，等于静默丢弃；带协议结构又还原不了的走 502 出口。
+                _allowed_resp = holder.get("allowed_names") or set()
+                if (not _leak_garbage_only(clean_rem or text_buffer)
+                        and _allowed_resp
+                        and (_leak_residue_present(_outside_fences(text_buffer))
+                             or _dsml_residue_present(_outside_fences(text_buffer)))
+                        and not _echo_names_all_undeclared(text_buffer, _allowed_resp)):
+                    log("unrecovered leak residue in tools session (%d chars) — "
+                        "failing the turn closed (responses)" % len(text_buffer),
+                        level="WARN", tag="chat")
+                    raise EmptyToolEcho(len(text_buffer), "unrecovered_responses")
         if calls_rem:
             dsml_tool_calls.extend(calls_rem)
         if clean_rem:
