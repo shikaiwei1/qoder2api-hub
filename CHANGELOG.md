@@ -20,6 +20,30 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.11
+
+**🐛 问题修复**
+
+- **Anthropic 流式：tool_use 首帧缺 name 时透传空 name，下游整轮失败**（#116）：上游偶发「新 index 的首帧不带 name」，而 `content_block_start` 一旦发出就不能再补（协议不允许改已发出的块），下游收到 `name: ""` 直接判 `MALFORMED_RESPONSE`。
+  现在**缓冲** tool_use 块：name 非空才发 start，期间到达的 arguments 先攒着、start 后按序补发；流结束仍无名则丢弃该块并降级 `stop_reason`（不会让下游一直等一个永远不来的工具结果）。非流式侧同样不发空 name。
+  顺带修掉一处隐性缺陷：`qoder_anthropic` 模块内原本没有 `log`，异常路径会 `NameError` —— 现在由宿主注入（模块保持只 import 标准库）。
+
+- **移除误导性的「计费自检」**（#121）：实测上游对网关身份**所有模型都回报 `auto`**（`dfmodel` 同样如此），该字段不携带计费信息。已移除 `/diag/model-billing` 端点、面板「自检」按钮、`usage.billed_model` 字段与「计费→auto」徽标，避免继续误导用户。
+
+- **树莓派等单板计算机被误判成 KVM 虚拟机**（#123）：新增设备树型号判据（`/proc/device-tree/model`），命中 SBC 即不参与虚拟化判定，看板不再误报。
+
+**✨ 新增：签到诊断（只读）**
+
+- `POST /diag/checkin {uid}`（面板鉴权）：一次性回显上游 `status`（`DISABLED/active/today_checked_in`）、签到能力探测、活动列表（字段名原样列出）与 `can_checkin`。**不发起领取**，不会误领。
+
+**🔧 合并的社区 PR**
+
+- **Kimi 计费归因**（#119）：确认上游计费归因读 `business.model_key`，网关此前不发该字段 → 只有新模型被记成 auto。现在 `business` 块始终带 `model_key`，`business.version` 与 `cosy-version` 对齐；同时修掉「官方改名后客户端用新显示名请求、被原样当上游 key 发出」的解析缺口（动态显示名索引 + 请求路径离线兜底，不出网、不触发选号）。
+- **流式 fail-closed**（#120）：上游断在半路或残留工具协议碎片（DSML / 标记空壳）时不再当成正文补发，改为明确的失败收尾，避免客户端把残片解析成半截工具参数后整轮丢失。
+- **README**（#122）：补充姊妹项目链接。
+
+**验证**：新增 `_test_issue116_anthropic_tool_name`(15)、`_test_issue123_sbc_vm`(9)、`_test_issue123_checkin_diag`(10)，加上合并 PR 自带的 `_test_business_model_key`(14)、`_test_live_model_names`(29)、`_test_issue112_truncated_stream`(11)、`_test_issue120_unrecovered_dsml`(19)、`_test_issue120c_residue_edges`(8)；全量 **97 suites / 2571 checks / 0 failed**。
+
 ## v1.7.10
 
 **🐛 问题修复**

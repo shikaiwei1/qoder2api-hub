@@ -50,6 +50,8 @@ import qoder_accounts
 import qoder_activity
 import qoder_agents
 import qoder_anthropic
+
+# issue #116：把宿主日志注入 anthropic 模块（它自己只 import 标准库）
 import qoder_catalog
 import qoder_pricing
 import qoder_settings
@@ -2571,6 +2573,10 @@ def log(msg, level=None, tag=None):
     sys.stderr.flush()
     add_log_entry(msg, level=level, tag=tag)
 
+
+
+# issue #116：把宿主日志注入 anthropic 模块（它只 import 标准库，无法反向 import 本模块）
+qoder_anthropic._bind_log(log)
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
     with _LOG_LOCK:

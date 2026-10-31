@@ -23,18 +23,17 @@ import time
 import uuid
 
 
+_host_log = None
+
+
 def log(*args, **kwargs):
-    """日志转发：宿主（qoder_proxy）通常已把 log 注入全局；本模块单独 import
-    时退回 qoder_proxy.log，再不行就丢弃——日志绝不能影响协议输出。"""
-    fn = globals().get("_host_log")
-    if fn is not None:
-        try:
-            return fn(*args, **kwargs)
-        except Exception:
-            return None
+    """日志转发：宿主在 import 后调用 _bind_log(log) 注入（保持本模块零依赖、
+    只 import 标准库）；未注入时静默丢弃——日志绝不能影响协议输出。"""
+    fn = _host_log
+    if fn is None:
+        return None
     try:
-        import qoder_proxy as _p
-        return _p.log(*args, **kwargs)
+        return fn(*args, **kwargs)
     except Exception:
         return None
 
