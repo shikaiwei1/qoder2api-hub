@@ -716,3 +716,200 @@ class CosySessionCache(object):
 
 
 SESSIONS = CosySessionCache()
+
+
+# ===========================================================================
+# [本地补丁] 出站品牌身份句守卫（默认关闭）
+#
+# 这不是上游仓库的一部分，而是随部署长期携带的私有补丁（上游 PR #168 已被
+# 拒绝：维护者不接受网关改写消息来规避上游拒绝）。因此它的唯一硬约束是
+# **改动面最小、最不容易与上游后续提交冲突**：
+#   - 代码整体追加在本文件末尾，不新增模块文件 —— 新增文件必须同步改
+#     Dockerfile 的 COPY 清单和 qoder_proxy.py 的 import 块，而这两处近 60 天
+#     各被上游改了 19 / 14 次；
+#   - 本文件近 60 天只被改过 5 次（且都在文件头部），qoder_proxy.py 已
+#     `import qoder_sign`，所以入口只需在那里加一行调用；
+#   - 依赖（os / re / qoder_settings）都在本节内部解决，不动文件头 import 块。
+#
+# 背景（2026-11-23 受控 A/B 实测）：Qoder 上游在当日下午对出站 messages 中的
+# 第三方 Agent 身份句做**字面子串检测**（大小写敏感）。命中即返回 HTTP 200 +
+# SSE 内嵌 403/10605/RESOURCE_LIMIT 信封（queueType=p1、queueCount=0、
+# serviceAvailable=false、retryAfterSeconds=30）——是硬拒绝伪装成排队，等待后
+# 重试仍被拒。ZCode / DSH / Claude Code / Codex 等客户端因此全面报错，官方
+# Qoder 客户端与不含这些句子的请求不受影响。与出口 IP / 账号 / 机器身份头 /
+# 工具定义无关，且对所有模型生效（网关层前置拦截，响应仅 0.2-0.5s）。
+# 注意：该门控并非一直生效（11-25 上午实测已不触发），疑为时段或负载相关，
+# 所以补丁默认关闭，复现时再开。
+#
+# 实测确认的触发形态（逗号 / 句号必须紧跟品牌名）：
+#     "You are ZCode,"              命中      "You are ZCode ,"     不命中
+#     "You are Claude Code,"        命中      "You are ZCode."      不命中
+#     "You are Codex,"              命中      "You are zcode,"      不命中
+#     "powered by DeepSeek Harness." 命中     "powered by the …"    不命中
+#
+# 对策 —— 最小字符级中和：只在命中片段的标点前插入一个空格打断字面匹配，
+# 品牌名、语序、语义全部保留。中和是确定性的，同一对话跨轮字节稳定，所以
+# 不影响上游前缀缓存，也不影响网关自己的会话亲和 / prefix session cache
+# （二者都对中和**之后**的 messages 取键）。
+#
+# 品牌名用通用正则而非固定名单（上游随时增补品牌，名单追不上）：大写字母
+# 开头，允许空格 / 连字符连接多词、允许数字尾词；小写词（a / an / the / my）
+# 天然不匹配，因此 "You are a helpful assistant," 这类普通句子零改动。未知
+# 品牌同样中和 —— 多一个空格语义无损，宁宽覆盖不漏检。
+#
+# 自家品牌 Qoder 豁免（OWN_BRANDS）：上游不拦截 Qoder 自己的身份句，而网关
+# 默认系统提示词正是 "You are Qoder, …"。豁免后，不含第三方品牌句的普通请求
+# 出站零改动，缓存前缀与官方逐字节一致，部署本补丁不会让既有缓存失效。
+#
+# 开关（环境变量优先）：
+#     QD_IDENTITY_GUARD=1            开启（0 / off / false / no 关闭）
+#     accounts/settings.json         {"identity_guard": true}   免重启
+#
+# 覆盖范围：messages 的 content（含多模态 text part）、reasoning_content、
+# tool_calls[].function.arguments。chat_context / business.name 取自同一批
+# 消息 dict，随之保持一致。11-23 只验证了 messages 正文是触发面；其余字段
+# 属预防性覆盖（多中和一个空格无副作用）。
+# ===========================================================================
+import os                     # noqa: E402  本节自持依赖，不改动文件头 import 块
+import re                     # noqa: E402
+
+# 通用品牌名：大写开头，词间允许单个空格或连字符（后续词须大写 / 数字开头）。
+_BRAND = r"[A-Z][A-Za-z0-9]*(?:[ -][A-Z0-9][A-Za-z0-9]*)*"
+
+# 与上游检测同口径：大小写敏感，逗号 / 句号必须紧跟品牌名。中和后（标点前
+# 已有空格）不再命中，所以天然幂等。
+_IDENTITY_RE = re.compile(r"You are (" + _BRAND + r"),")
+_POWERED_RE = re.compile(r"powered by (" + _BRAND + r")\.")
+
+# 自家品牌豁免，理由见本节头注释。
+OWN_BRANDS = frozenset({"Qoder"})
+
+
+def brand_guard_enabled(accounts_dir=None):
+    """出站品牌身份句守卫是否开启：环境变量优先，其次 settings.json，默认关闭。"""
+    raw = str(os.environ.get("QD_IDENTITY_GUARD") or "").strip().lower()
+    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
+        return True
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return False
+    if not accounts_dir:
+        return False
+    try:
+        import qoder_settings          # 延迟导入：不改本文件头部的依赖关系
+        return qoder_settings.load(accounts_dir).get("identity_guard") is True
+    except Exception:
+        return False
+
+
+def neutralize_brand_signatures(text):
+    """对单个字符串做最小中和；返回 (文本, 命中次数)。
+
+    无命中时返回原对象（同一性成立），调用方可据此跳过复制。
+    """
+    if not isinstance(text, str) or not text:
+        return text, 0
+    hits = 0
+
+    def _identity(m):
+        nonlocal hits
+        if m.group(1) in OWN_BRANDS:
+            return m.group(0)          # 自家品牌豁免
+        hits += 1
+        # "You are ZCode," -> "You are ZCode ,"
+        return m.group(0)[:-1] + " ,"
+
+    def _powered(m):
+        nonlocal hits
+        if m.group(1) in OWN_BRANDS:
+            return m.group(0)          # 自家品牌豁免
+        hits += 1
+        # "powered by DeepSeek Harness." -> "powered by DeepSeek Harness ."
+        return m.group(0)[:-1] + " ."
+
+    out = _IDENTITY_RE.sub(_identity, text)
+    out = _POWERED_RE.sub(_powered, out)
+    # 零命中时返回原对象：re.sub 即使替换内容不变也会重建字符串（自家品牌
+    # 豁免正是这种情况），这里显式还原「无改动 = 同一对象」。
+    if not hits:
+        return text, 0
+    return out, hits
+
+
+def _brand_guard_content(content):
+    """content 可能是 str 或多模态 part 列表；只动 text part（写时复制）。"""
+    if isinstance(content, str):
+        return neutralize_brand_signatures(content)
+    if not isinstance(content, list):
+        return content, 0
+    copied, hits = None, 0
+    for index, part in enumerate(content):
+        if not (isinstance(part, dict) and isinstance(part.get("text"), str)):
+            continue
+        new, n = neutralize_brand_signatures(part["text"])
+        if not n:
+            continue
+        if copied is None:
+            copied = list(content)
+        copied[index] = dict(part, text=new)
+        hits += n
+    return (copied, hits) if hits else (content, 0)
+
+
+def brand_guard_messages(messages):
+    """就地中和一组出站消息；返回命中次数。
+
+    消息 dict 本身保持同一对象，只替换命中字段的值 —— build_qoder_body 里
+    body["messages"] 与 flat 共享这批 dict，其后的 chat_context / business.name
+    从 flat 取值，因此自动与正文保持一致。多模态 part 与 tool_calls 条目按
+    写时复制，不改动可能被别处共享的内层对象。
+    """
+    total = 0
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        new, hits = _brand_guard_content(message.get("content"))
+        if hits:
+            message["content"] = new
+            total += hits
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str):
+            new, hits = neutralize_brand_signatures(reasoning)
+            if hits:
+                message["reasoning_content"] = new
+                total += hits
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        copied, hits = None, 0
+        for index, call in enumerate(calls):
+            fn = call.get("function") if isinstance(call, dict) else None
+            arguments = fn.get("arguments") if isinstance(fn, dict) else None
+            if not isinstance(arguments, str):
+                continue
+            new, n = neutralize_brand_signatures(arguments)
+            if not n:
+                continue
+            if copied is None:
+                copied = list(calls)
+            copied[index] = dict(call, function=dict(fn, arguments=new))
+            hits += n
+        if hits:
+            message["tool_calls"] = copied
+            total += hits
+    return total
+
+
+def apply_brand_guard(body, accounts_dir=None, log=None):
+    """出站请求体入口（由 qoder_proxy.build_qoder_body 调用）。
+
+    开关关闭时零改动、零开销地返回 0；否则就地中和 body["messages"]，
+    返回命中次数，并在有命中时写一行日志，便于在运行端确认守卫生效。
+    """
+    if not brand_guard_enabled(accounts_dir):
+        return 0
+    messages = body.get("messages") if isinstance(body, dict) else None
+    hits = brand_guard_messages(messages)
+    if hits and log:
+        log("brand guard: neutralized %d third-party agent signature(s) "
+            "(upstream 10605 brand gate)" % hits, tag="chat")
+    return hits

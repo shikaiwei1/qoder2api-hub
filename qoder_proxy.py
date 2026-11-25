@@ -7288,6 +7288,9 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
                             if (m or {}).get("role") == "system"]
     # 追加真实会话
     body["messages"].extend(flat)
+    # [本地补丁] 出站品牌身份句守卫（默认关，见 qoder_sign.apply_brand_guard）。
+    # 就地中和：messages 与 flat 共享同一批 dict，chat_context / business.name 随之一致。
+    qoder_sign.apply_brand_guard(body, ACCOUNTS_DIR, log)
 
     # 最新用户提示词（上游 chat_context 高亮 + business 会话名）
     prompt = ""
